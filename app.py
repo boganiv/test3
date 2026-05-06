@@ -4,10 +4,9 @@ import pandas as pd
 import time
 import secrets
 import hashlib
+import hmac
+import base64
 from datetime import datetime
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import serialization, hashes, hmac
-from cryptography.fernet import Fernet
 
 DB_NAME = "p2p_auth.db"
 
@@ -35,9 +34,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # ---------------- DATABASE ----------------
+
 def get_connection():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
 
 def create_tables():
     conn = get_connection()
@@ -66,6 +68,7 @@ def create_tables():
     conn.commit()
     conn.close()
 
+
 def add_peer(peer_name, public_key):
     conn = get_connection()
     cur = conn.cursor()
@@ -76,6 +79,7 @@ def add_peer(peer_name, public_key):
     conn.commit()
     conn.close()
 
+
 def get_peer(peer_name):
     conn = get_connection()
     cur = conn.cursor()
@@ -84,11 +88,16 @@ def get_peer(peer_name):
     conn.close()
     return result[0] if result else None
 
+
 def get_all_peers():
     conn = get_connection()
-    df = pd.read_sql_query("SELECT id, peer_name, created_at FROM peers ORDER BY id DESC", conn)
+    df = pd.read_sql_query(
+        "SELECT id, peer_name, created_at FROM peers ORDER BY id DESC",
+        conn
+    )
     conn.close()
     return df
+
 
 def add_log(peer_name, phase, status, details):
     conn = get_connection()
@@ -96,9 +105,16 @@ def add_log(peer_name, phase, status, details):
     cur.execute("""
     INSERT INTO logs (peer_name, phase, status, details, timestamp)
     VALUES (?, ?, ?, ?, ?)
-    """, (peer_name, phase, status, details, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    """, (
+        peer_name,
+        phase,
+        status,
+        details,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
     conn.commit()
     conn.close()
+
 
 def get_logs():
     conn = get_connection()
@@ -106,75 +122,71 @@ def get_logs():
     conn.close()
     return df
 
-# ---------------- CRYPTO ----------------
-def generate_keys():
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
 
-    private_pem = private_key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption()
-    ).decode()
+# ---------------- SECURITY FUNCTIONS ----------------
 
-    public_pem = public_key.public_bytes(
-        serialization.Encoding.PEM,
-        serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode()
+def generate_private_key():
+    return secrets.token_urlsafe(48)
 
-    return private_pem, public_pem
 
-def sign_message(private_pem, message):
-    private_key = serialization.load_pem_private_key(private_pem.encode(), password=None)
-    return private_key.sign(
+def generate_public_key(private_key):
+    return hashlib.sha256(private_key.encode()).hexdigest()
+
+
+def sign_message(private_key, message):
+    return hmac.new(
+        private_key.encode(),
         message.encode(),
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH
-        ),
-        hashes.SHA256()
-    )
+        hashlib.sha256
+    ).hexdigest()
 
-def verify_signature(public_pem, message, signature):
-    public_key = serialization.load_pem_public_key(public_pem.encode())
-    try:
-        public_key.verify(
-            signature,
-            message.encode(),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return True
-    except Exception:
-        return False
+
+def verify_identity(private_key, stored_public_key):
+    generated_public_key = generate_public_key(private_key)
+    return hmac.compare_digest(generated_public_key, stored_public_key)
+
 
 def generate_session_key():
-    return Fernet.generate_key()
+    return secrets.token_urlsafe(32)
 
-def encrypt_message(key, message):
-    return Fernet(key).encrypt(message.encode())
 
-def decrypt_message(key, encrypted):
-    return Fernet(key).decrypt(encrypted).decode()
+def xor_encrypt_decrypt(data, key):
+    key_bytes = hashlib.sha256(key.encode()).digest()
+    data_bytes = data.encode()
+
+    output = bytearray()
+    for i, b in enumerate(data_bytes):
+        output.append(b ^ key_bytes[i % len(key_bytes)])
+
+    return base64.b64encode(output).decode()
+
+
+def xor_decrypt(encrypted_data, key):
+    key_bytes = hashlib.sha256(key.encode()).digest()
+    encrypted_bytes = base64.b64decode(encrypted_data.encode())
+
+    output = bytearray()
+    for i, b in enumerate(encrypted_bytes):
+        output.append(b ^ key_bytes[i % len(key_bytes)])
+
+    return output.decode()
+
 
 def generate_mac(key, message):
-    h = hmac.HMAC(key, hashes.SHA256())
-    h.update(message.encode())
-    return h.finalize()
+    return hmac.new(
+        key.encode(),
+        message.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
-def verify_mac(key, message, mac):
-    try:
-        h = hmac.HMAC(key, hashes.SHA256())
-        h.update(message.encode())
-        h.verify(mac)
-        return True
-    except Exception:
-        return False
+
+def verify_mac(key, message, mac_value):
+    expected_mac = generate_mac(key, message)
+    return hmac.compare_digest(expected_mac, mac_value)
+
 
 # ---------------- INIT ----------------
+
 create_tables()
 
 if "verified_peer" not in st.session_state:
@@ -192,7 +204,9 @@ if "logged_in" not in st.session_state:
 if "current_peer" not in st.session_state:
     st.session_state.current_peer = None
 
+
 # ---------------- SIDEBAR ----------------
+
 st.sidebar.title("🔐 P2P Security")
 
 menu = st.sidebar.radio(
@@ -212,17 +226,22 @@ menu = st.sidebar.radio(
 )
 
 st.sidebar.markdown("---")
+
 if st.session_state.logged_in:
     st.sidebar.success(f"Logged in as: {st.session_state.current_peer}")
 else:
     st.sidebar.warning("Not logged in")
 
+
 # ---------------- HEADER ----------------
+
 st.title("🔐 Secure Three-Phase P2P Authentication System")
-st.caption("Python + Streamlit + SQLite + RSA + Session Key + Secure Login")
+st.caption("Python + Streamlit + SQLite + Hashing + HMAC + Session Key + Secure Login")
 st.markdown("---")
 
+
 # ---------------- DASHBOARD ----------------
+
 if menu == "Dashboard":
     st.header("System Dashboard")
 
@@ -237,7 +256,7 @@ if menu == "Dashboard":
 
     st.subheader("Authentication Flow")
     st.info("""
-    Register Peer → Phase 1 Identity Verification → Phase 2 Session Key → 
+    Register Peer → Phase 1 Identity Verification → Phase 2 Session Key →
     Phase 3 Secure Transfer → Secure Login → Application Dashboard
     """)
 
@@ -245,69 +264,86 @@ if menu == "Dashboard":
         st.subheader("Registered Peers")
         st.dataframe(peers, use_container_width=True)
 
-# ---------------- REGISTER ----------------
+
+# ---------------- REGISTER PEER ----------------
+
 elif menu == "Register Peer":
     st.header("Register Peer")
 
     peer_name = st.text_input("Peer Name", placeholder="Example: Peer_A")
 
-    if st.button("Generate Keys and Register", use_container_width=True):
+    if st.button("Generate Key and Register", use_container_width=True):
         if peer_name.strip() == "":
             st.error("Please enter a peer name.")
         else:
-            private_key, public_key = generate_keys()
+            private_key = generate_private_key()
+            public_key = generate_public_key(private_key)
+
             add_peer(peer_name, public_key)
-            add_log(peer_name, "Registration", "Success", "Peer registered with RSA public key")
+            add_log(peer_name, "Registration", "Success", "Peer registered successfully")
 
             st.success("Peer registered successfully.")
 
             st.download_button(
                 "Download Private Key",
                 private_key,
-                file_name=f"{peer_name}_private_key.pem",
+                file_name=f"{peer_name}_private_key.txt",
                 mime="text/plain"
             )
 
-            st.subheader("Public Key")
-            st.text_area("Stored Public Key", public_key, height=180)
+            st.subheader("Stored Public Key Hash")
+            st.code(public_key)
 
             st.warning("Download and keep the private key safely. It is required for Phase 1.")
 
+
 # ---------------- PHASE 1 ----------------
+
 elif menu == "Phase 1: Identity Verification":
-    st.header("Phase 1: RSA Identity Verification")
+    st.header("Phase 1: Identity Verification")
 
     peer_name = st.text_input("Peer Name", placeholder="Example: Peer_A")
-    private_key = st.text_area("Paste Private Key", height=220)
-    message = "Authenticate Peer"
+    private_key = st.text_area("Paste Private Key", height=150)
 
     if st.button("Verify Identity", use_container_width=True):
-        public_key = get_peer(peer_name)
+        stored_public_key = get_peer(peer_name)
 
-        if not public_key:
+        if not stored_public_key:
             st.error("Peer not found. Register peer first.")
         elif not private_key.strip():
             st.error("Please paste the private key.")
         else:
-            try:
-                start = time.time()
-                signature = sign_message(private_key, message)
-                verified = verify_signature(public_key, message, signature)
-                latency = round((time.time() - start) * 1000, 2)
+            start = time.time()
 
-                if verified:
-                    st.session_state.verified_peer = peer_name
-                    st.session_state.current_peer = peer_name
-                    add_log(peer_name, "Phase 1", "Success", f"RSA signature verified in {latency} ms")
-                    st.success(f"Phase 1 successful. Identity verified. Latency: {latency} ms")
-                else:
-                    add_log(peer_name, "Phase 1", "Failed", "RSA signature verification failed")
-                    st.error("Verification failed.")
-            except Exception as e:
-                add_log(peer_name, "Phase 1", "Failed", str(e))
-                st.error("Invalid private key.")
+            verified = verify_identity(private_key.strip(), stored_public_key)
+
+            latency = round((time.time() - start) * 1000, 2)
+
+            if verified:
+                st.session_state.verified_peer = peer_name
+                st.session_state.current_peer = peer_name
+
+                add_log(
+                    peer_name,
+                    "Phase 1",
+                    "Success",
+                    f"Identity verified in {latency} ms"
+                )
+
+                st.success(f"Phase 1 successful. Identity verified. Latency: {latency} ms")
+            else:
+                add_log(
+                    peer_name,
+                    "Phase 1",
+                    "Failed",
+                    "Private key did not match stored public key"
+                )
+
+                st.error("Verification failed. Invalid private key.")
+
 
 # ---------------- PHASE 2 ----------------
+
 elif menu == "Phase 2: Session Key":
     st.header("Phase 2: Secure Session Key Establishment")
 
@@ -319,18 +355,25 @@ elif menu == "Phase 2: Session Key":
         elif st.session_state.verified_peer != peer_name:
             st.error("Complete Phase 1 identity verification first.")
         else:
-            st.session_state.session_key = generate_session_key()
+            session_key = generate_session_key()
+            st.session_state.session_key = session_key
+
             add_log(peer_name, "Phase 2", "Success", "Secure session key generated")
 
             st.success("Phase 2 successful. Session key generated.")
-            st.code(st.session_state.session_key.decode())
+            st.code(session_key)
+
 
 # ---------------- PHASE 3 ----------------
+
 elif menu == "Phase 3: Secure Transfer":
     st.header("Phase 3: Secure Content Transfer")
 
     peer_name = st.text_input("Peer Name", value=st.session_state.current_peer or "")
-    content = st.text_area("Enter secure content", placeholder="Example: Confidential P2P content")
+    content = st.text_area(
+        "Enter secure content",
+        placeholder="Example: Confidential P2P content"
+    )
 
     if st.button("Encrypt and Verify Transfer", use_container_width=True):
         if st.session_state.session_key is None:
@@ -341,26 +384,33 @@ elif menu == "Phase 3: Secure Transfer":
             st.error("Please enter content.")
         else:
             start = time.time()
-            encrypted = encrypt_message(st.session_state.session_key, content)
-            decrypted = decrypt_message(st.session_state.session_key, encrypted)
 
-            mac = generate_mac(st.session_state.session_key, content)
-            integrity = verify_mac(st.session_state.session_key, content, mac)
+            encrypted = xor_encrypt_decrypt(content, st.session_state.session_key)
+            decrypted = xor_decrypt(encrypted, st.session_state.session_key)
+
+            mac_value = generate_mac(st.session_state.session_key, content)
+            integrity = verify_mac(st.session_state.session_key, content, mac_value)
 
             latency = round((time.time() - start) * 1000, 2)
 
             if integrity and decrypted == content:
                 st.session_state.phase3_complete = True
-                add_log(peer_name, "Phase 3", "Success", f"Content encrypted and integrity verified in {latency} ms")
+
+                add_log(
+                    peer_name,
+                    "Phase 3",
+                    "Success",
+                    f"Content encrypted and integrity verified in {latency} ms"
+                )
 
                 st.success("Phase 3 successful. Secure transfer completed.")
                 st.info("Now go to Secure Login to enter the protected application.")
 
                 st.subheader("Encrypted Content")
-                st.code(encrypted.decode())
+                st.code(encrypted)
 
                 st.subheader("HMAC Integrity Code")
-                st.code(mac.hex())
+                st.code(mac_value)
 
                 st.subheader("Decrypted Content")
                 st.write(decrypted)
@@ -368,7 +418,9 @@ elif menu == "Phase 3: Secure Transfer":
                 add_log(peer_name, "Phase 3", "Failed", "Integrity verification failed")
                 st.error("Integrity verification failed.")
 
+
 # ---------------- SECURE LOGIN ----------------
+
 elif menu == "Secure Login":
     st.header("Secure Login")
 
@@ -388,10 +440,19 @@ elif menu == "Secure Login":
         else:
             st.session_state.logged_in = True
             st.session_state.current_peer = peer_name
-            add_log(peer_name, "Secure Login", "Success", "Peer logged into protected application")
+
+            add_log(
+                peer_name,
+                "Secure Login",
+                "Success",
+                "Peer logged into protected application"
+            )
+
             st.success("Login successful. You can now access the Application Dashboard.")
 
+
 # ---------------- APPLICATION DASHBOARD ----------------
+
 elif menu == "Application Dashboard":
     if not st.session_state.logged_in:
         st.error("Access denied. Complete all three phases and secure login first.")
@@ -399,7 +460,9 @@ elif menu == "Application Dashboard":
         st.header("Protected P2P Content Application")
         st.success(f"Welcome, {st.session_state.current_peer}")
 
-        tab1, tab2, tab3 = st.tabs(["Secure Message", "Upload Content", "Session Info"])
+        tab1, tab2, tab3 = st.tabs(
+            ["Secure Message", "Upload Content", "Session Info"]
+        )
 
         with tab1:
             st.subheader("Send Secure Message")
@@ -409,12 +472,27 @@ elif menu == "Application Dashboard":
                 if message.strip() == "":
                     st.error("Enter a message.")
                 else:
-                    encrypted = encrypt_message(st.session_state.session_key, message)
+                    encrypted = xor_encrypt_decrypt(
+                        message,
+                        st.session_state.session_key
+                    )
+
+                    mac_value = generate_mac(
+                        st.session_state.session_key,
+                        message
+                    )
+
                     st.success("Message encrypted successfully.")
-                    st.code(encrypted.decode())
+
+                    st.subheader("Encrypted Message")
+                    st.code(encrypted)
+
+                    st.subheader("Message MAC")
+                    st.code(mac_value)
 
         with tab2:
             st.subheader("Upload P2P Content")
+
             uploaded_file = st.file_uploader("Upload a file")
 
             if uploaded_file:
@@ -429,29 +507,30 @@ elif menu == "Application Dashboard":
 
         with tab3:
             st.subheader("Session Information")
+
             st.write("Authenticated Peer:", st.session_state.current_peer)
             st.write("Phase 1:", "Completed")
             st.write("Phase 2:", "Completed")
             st.write("Phase 3:", "Completed")
             st.write("Login Status:", "Logged In")
 
+
 # ---------------- ATTACK SIMULATION ----------------
+
 elif menu == "Attack Simulation":
     st.header("MITM / Identity Attack Simulation")
 
     target_peer = st.text_input("Target Peer Name", placeholder="Example: Peer_A")
 
     if st.button("Simulate Attack", use_container_width=True):
-        real_public_key = get_peer(target_peer)
+        stored_public_key = get_peer(target_peer)
 
-        if not real_public_key:
+        if not stored_public_key:
             st.error("Target peer not found.")
         else:
-            fake_private, _ = generate_keys()
-            fake_message = "Authenticate Peer"
-            fake_signature = sign_message(fake_private, fake_message)
+            fake_private_key = generate_private_key()
 
-            attack_result = verify_signature(real_public_key, fake_message, fake_signature)
+            attack_result = verify_identity(fake_private_key, stored_public_key)
 
             if attack_result:
                 add_log("Attacker", "Attack Simulation", "Failed", "Fake identity accepted")
@@ -460,7 +539,9 @@ elif menu == "Attack Simulation":
                 add_log("Attacker", "Attack Simulation", "Success", "Fake identity rejected")
                 st.success("Attack blocked: Fake identity rejected.")
 
+
 # ---------------- LOGS ----------------
+
 elif menu == "Authentication Logs":
     st.header("Authentication Logs")
 
@@ -469,9 +550,13 @@ elif menu == "Authentication Logs":
     if logs.empty:
         st.info("No logs available.")
     else:
-        phase_filter = st.selectbox("Filter by Phase", ["All"] + sorted(logs["phase"].unique().tolist()))
+        phase_filter = st.selectbox(
+            "Filter by Phase",
+            ["All"] + sorted(logs["phase"].unique().tolist())
+        )
 
         filtered = logs.copy()
+
         if phase_filter != "All":
             filtered = filtered[filtered["phase"] == phase_filter]
 
@@ -484,12 +569,15 @@ elif menu == "Authentication Logs":
             mime="text/csv"
         )
 
+
 # ---------------- LOGOUT ----------------
+
 elif menu == "Logout":
     st.header("Logout")
 
     if st.button("Logout", use_container_width=True):
         peer = st.session_state.current_peer or "Unknown"
+
         add_log(peer, "Logout", "Success", "Peer logged out")
 
         st.session_state.logged_in = False
